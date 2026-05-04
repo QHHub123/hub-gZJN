@@ -102,9 +102,9 @@ class TextClassificationDataset(Dataset):
         return torch.tensor(tokens, dtype=torch.long), torch.tensor(label, dtype=torch.long)
 
 # ==================== 2. 模型定义 ====================
-class TextRNNClassifier(nn.Module):
+class TextLSTMClassifier(nn.Module):
     """
-    文本分类模型，使用LSTM
+    文本分类模型，使用LSTM + MaxPool + BN
     架构：Embedding → LSTM → MaxPool → BN → Dropout → Linear → Sigmoid → (MSELoss)
     每个参数含义
     vocab_size: 词汇表大小
@@ -116,7 +116,7 @@ class TextRNNClassifier(nn.Module):
     bidirectional: 是否使用双向LSTM
     """
     def __init__(self, vocab_size, embed_dim, hidden_dim, num_layers, num_classes, dropout=0.5, bidirectional=True):
-        super(TextRNNClassifier, self).__init__()
+        super(TextLSTMClassifier, self).__init__()
 
         # Embedding层
         self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=0)
@@ -135,6 +135,15 @@ class TextRNNClassifier(nn.Module):
         # 如果是双向LSTM，输出维度是 hidden_dim * 2
         lstm_output_dim = hidden_dim * 2 if bidirectional else hidden_dim
 
+
+        # --- 新增：自适应最大池化层 ---
+        # 输入: (batch, channels, length) -> 输出: (batch, channels, 1)
+        # 这里的 channels 就是 lstm_output_dim
+        self.pool = nn.AdaptiveMaxPool1d(1)
+
+        # BatchNorm1d
+        self.bn = nn.BatchNorm1d(lstm_output_dim)
+
         # 全连接层
         self.fc = nn.Linear(lstm_output_dim, num_classes)
 
@@ -144,27 +153,36 @@ class TextRNNClassifier(nn.Module):
     def forward(self, x):
         # x shape: (batch_size, seq_len)
 
-        # Embedding
+        # 1. Embedding
         embedded = self.embedding(x)  # (batch_size, seq_len, embed_dim)
 
-        # LSTM
+        # 2. LSTM
         # output: (batch_size, seq_len, num_directions * hidden_dim)
-        # hidden: (num_layers * num_directions, batch_size, hidden_dim)
-        # c: (num_layers * num_directions, batch_size, hidden_dim)
         output, (hidden, c) = self.lstm(embedded)
 
-        # 提取特征用于分类
-        # 方法1：使用最后一个时间步的输出 (对于双向LSTM，需要拼接最后两个方向的输出)
-        if self.lstm.bidirectional:
-            # hidden[-1] 是前向最后一层, hidden[-2] 是后向最后一层
-            hidden_cat = torch.cat((hidden[-2], hidden[-1]), dim=1)
-        else:
-            hidden_cat = hidden[-1]
+        # 3. 准备池化
+        # PyTorch 的池化层通常要求输入格式为 (N, C, L)，即 (Batch, Channels, Length)
+        # LSTM 输出是 (Batch, Length, Channels)，所以需要置换维度
+        # output.transpose(1, 2) 变为 (batch_size, lstm_output_dim, seq_len)
+        output_transposed = output.transpose(1, 2)
 
-        # Dropout
-        dropped = self.dropout(hidden_cat)
+        # 4. 最大池化
+        # 对时间维度 (seq_len) 进行最大池化，保留每个特征维度上的最大值
+        # 输出形状: (batch_size, lstm_output_dim, 1)
+        pooled = self.pool(output_transposed)
 
-        # Linear + Sigmoid
+        # 5. 压缩维度
+        # 去掉最后的维度 1，变为 (batch_size, lstm_output_dim)
+        # squeeze 操作移除大小为1的维度
+        pooled = pooled.squeeze(dim=-1)
+
+        # 6. BatchNorm1d
+        bn_out = self.bn(pooled)
+
+        # 6. Dropout
+        dropped = self.dropout(bn_out)
+
+        # 7. Linear + Sigmoid
         logits = self.fc(dropped)  # (batch_size, num_classes)
         output = torch.sigmoid(logits)
 
@@ -224,13 +242,13 @@ def train_model(model, train_loader, val_loader, num_epochs=10, learning_rate=0.
         with torch.no_grad(): # 禁用梯度计算
             for texts, labels in val_loader:
 
-                outputs = model(texts)
-                loss = criterion(outputs, labels)
+                outputs = model(texts) # 模型前向传播
+                loss = criterion(outputs, labels) # 计算损失
 
-                val_loss += loss.item()
-                _, predicted = torch.max(outputs.data, 1)
-                val_total += labels.size(0)
-                val_correct += (predicted == labels).sum().item()
+                val_loss += loss.item() # 3. 累加当前批次的损失值
+                _, predicted = torch.max(outputs.data, 1) # 4. 获取预测结果
+                val_total += labels.size(0)  # 5. 统计总样本数
+                val_correct += (predicted == labels).sum().item() # 6. 统计预测正确的样本数
 
                 print(f"outputs.data: {outputs.data},labels: {labels}")
 
@@ -273,7 +291,7 @@ def main():
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
 
     # 创建模型
-    model = TextRNNClassifier(
+    model = TextLSTMClassifier(
         vocab_size=dataset.vocab_size,
         embed_dim=embed_dim,
         hidden_dim=hidden_dim,
